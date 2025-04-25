@@ -1,0 +1,160 @@
+# Dockerfile 분석.
+
+- 사용하신다고 한 dockerfile
+
+```docker
+# 1. Build stage (멀티스테이지 빌드 사용)
+FROM node:20-alpine AS builder
+
+# 앱 디렉토리 설정
+WORKDIR /app
+
+# package.json과 package-lock.json 복사
+COPY package*.json ./
+
+# 의존성 설치
+RUN npm install
+
+# 소스 코드 복사
+COPY . .
+
+# Next.js 앱 빌드
+RUN npm run build
+
+# 2. Production stage (최종 이미지 생성)
+FROM node:20-alpine
+
+# 앱 디렉토리 설정
+WORKDIR /app
+
+# 빌드된 파일들을 복사
+COPY --from=builder /app ./
+
+# Next.js가 기본적으로 3000번 포트에서 실행됨
+EXPOSE 3000
+
+# Next.js 앱 실행 (SSR 모드)
+CMD ["npm", "start"]
+```
+
+- 사용하신다고 한 docker-compose
+
+```yaml
+services:
+  app:
+    image: ghcr.io/${GITHUB_USERNAME}/nextjs-app:latest  # 환경 변수를 사용하여 동적 처리
+    container_name: nextjs-app
+    restart: unless-stopped
+    ports:
+      - "3000:3000"  # Next.js 애플리케이션 포트
+    networks:
+      - app-network
+
+  nginx:
+    image: nginx:latest
+    container_name: nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"  # Nginx가 80번 포트에서 요청을 받음
+    volumes:
+      - /home/ec2-user/si-follow/react-frontend/conf/nginx.conf:/etc/nginx/conf.d/default.conf
+    networks:
+      - app-network
+
+networks:
+  app-network:
+    driver: bridge
+```
+
+- 트머시기에서 원래 사용하던 방식의 dockerfile
+
+```docker
+FROM node:22.14.0-slim
+WORKDIR /usr/src/app
+COPY . /usr/src/app/
+RUN apt-get update && apt-get install -y bash tzdata
+RUN ln -snf /usr/share/zoneinfo/Asia/Seoul /etc/localtime && \
+	echo "Asia/Seoul" > /etc/timezone
+```
+
+- 트머시기에서 원래 사용하던 방식의 docker-compose
+
+```yaml
+services:
+  bo_backend:
+    # build:
+    #   context: ./backend
+    #   dockerfile: Dockerfile
+    image: bo_backend_im:latest
+    container_name: bo_backend
+    ports:
+      - 8099:8000
+    volumes:
+      - ./backend:/usr/src/app
+    restart: always
+    ipc: host
+    env_file:
+      - ./backend/.env
+    environment:
+      - TZ=Asia/Seoul
+    # command: tail -F /dev/null
+    command: tail -F /dev/null
+    # command: python manage.py runserver 0.0.0.0:8000
+    # command: gunicorn config.asgi:application --workers 4 --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:8000
+
+  bo_frontend:
+    # build:
+    #   context: ./frontend
+    #   dockerfile: Dockerfile
+    image: bo_frontend_im:latest
+    container_name: bo_frontend
+    ports:
+      - 3099:3000
+    volumes:
+      - ./frontend:/usr/src/app
+    restart: always
+    ipc: host
+    environment:
+      - CHOKIDAR_USEPOLLING=true
+      - TZ=Asia/Seoul
+    command: tail -F /dev/null
+    # command: npm run dev # 개발 서버 시작
+    # command: npm build # frontend build
+    # command: npm start # 서빙 서버 시작
+```
+
+## 차이점
+
+- 가장 큰 차이점.
+    - npm install을 image 내에서 처리 하느냐?
+    - container command를 docker compose 단에서 하느냐?
+
+- 사용하신다고 하신 방식으로 진행하면 docker compose up -d 를 하면 이미지가 없을때 의존성을 해결하고 빌드 까지해서 배포까지 하는 dockerfile.
+- 하단의 방식은 기존에 방식과 같이 docker compose 단에서 command를 결정.
+- 단 하단의 방식으로 하면 npm install, npm build 명령어를 container 내부에서 직접 처리해야함.
+- 상단의 방식으로 처리해두면 CI/CD 자동화 처리 할때 유리함.
+- 하단의 방식은 개발 편의성이 높음.
+
+- npm install을 하고 나서 build는 강제가 아님. npm install을 하고 나서 npm run dev를 실행하면 개발서버가 동작하고 접속한 페이지를 알아서 빌드함.
+- 배포 할때는 npm install을 해둔 환경에서 npm build를 build dir이 만들어지고 해당 디렉토리에서 npm start를 하면 서버가 기동.
+
+- 최대한 오류를 없게 하고 싶다면 local과 container 내부의 node.js 버전을 맞춰두면 환경적인 요인이 최소화.
+- mac이라서 fast refresh 문제가 없다면 container 내부에서 모든 작업을 처리 하도록 작업을 진행. npm install을 local에서 하고 docker 내부에서 배포 하려고 하거나 하면 문제가 발생할 확률 높아짐.
+
+- ex)
+    
+    ```markdown
+      1. node_module install
+      docker-compose -f docker-compose-dev.yml run bo_frontend npm install --force --legacy-peer-deps
+    
+      2. node_module add
+      docker-compose -f docker-compose-dev.yml run bo_frontend npm install {module_name} --force --legacy-peer-deps
+      module_names:
+        @tanstack/react-table
+    ```
+    
+
+- compile, build 에 대해서는 알아두면 좋음.
+    - https://woohyun-king.tistory.com/208
+    - nextjs에 경우 개발서버는 코드를 작성하고 저장하면 save 감지해서 compile → build → deploy를 자동. 따라서 해당 기능 때문에 과부화가 심함.
+    - 실제 서빙 서버에 경우는 npm build 명령어 따라 구성한 빌드 툴을 통해서 빌드를 진행. turbopack이 rust언어로 작성된 신규 빌드 툴 단 신규 툴이라 에러가 많아서 추후 도입하는게 좋음.
